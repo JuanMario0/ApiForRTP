@@ -6,3 +6,10 @@ python-dotenv
 alembic
 passlib[bcrypt]
 python-jose[cryptograhpy]
+pandas
+numpy
+scikit-learn
+folium
+joblib
+requests
+python-multipart

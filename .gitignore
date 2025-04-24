@@ -1,0 +1,17 @@
+# Ignorar archivos de configuración del entorno
+.env
+
+# Ignorar archivos de modelos y datos generados
+*.pkl
+*.csv
+
+# Ignorar carpetas específicas
+static/
+__pycache__/
+
+# Ignorar archivos de logs
+*.log
+
+# Ignorar configuraciones de IDE
+.vscode/
+.idea/

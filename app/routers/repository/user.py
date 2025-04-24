@@ -2,24 +2,26 @@ from sqlalchemy.orm import Session
 from app.db import models
 from fastapi import HTTPException, status
 from app.hashing import Hash
+from app.schemas import UserCreate, UpdateUser
+from app.oauth import get_current_user
 
 
-
-def CrearUsuario(usuario, db:Session):
+def CrearUsuario(usuario: UserCreate, db: Session):
     usuario = usuario.dict()
     try:
-        nuevo_usuario =models.User(
-            username=usuario["username"],
-            password=Hash.hash_password(usuario["password"])
+        nuevo_usuario = models.User(
+            email=usuario["email"],
+            password=Hash.hash_password(usuario["password"])  # Hashear la contraseña
         )
         db.add(nuevo_usuario)
         db.commit()
         db.refresh(nuevo_usuario)
+        return nuevo_usuario
     except Exception as e:
-         raise HTTPException(
-              status_code=status.HTTP_409_CONFLICT,
-              detail = f"Error creando usuario: {e}"
-         )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Error creando usuario: {e}"
+        )
 
 
 
@@ -63,4 +65,3 @@ def ActualizarUsuario(userId, updateUser, db:Session):
     db.commit()
         
     return {"Respuesta":"Usuario actualizado"}
-     
