@@ -1,27 +1,30 @@
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
-from sklearn.cluster import MiniBatchKMeans
-from app.db.database import get_db
-from app.db.models import Stop, Comment
+import os
 import pandas as pd
 import numpy as np
-from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 import folium
 from folium.plugins import HeatMap
 import joblib
-import os
 import re
 from datetime import datetime
-from app.oauth import get_current_user  # Aseguramos que se use el sistema de autenticación existente
-from app.schemas import User, StopDetails, ClusterDetails, Token, Comment as CommentSchema, CommentCreate, CommentRequest
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+from app.db.database import get_db
+from app.db.models import Stop, Comment
+from app.oauth import get_current_user
+from app.schemas import User, StopDetails, ClusterDetails, CommentRequest, CommentCreate
 from typing import List, Dict
+import logging
+import time
 
 router = APIRouter(
     prefix="/data",
     tags=["Data Processing"]
 )
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
 
 # Cargar el modelo y vectorizador de PLN
 try:
@@ -36,7 +39,6 @@ except FileNotFoundError:
 groserias = [
     "puto", "puta", "chinga", "cabrón", "cabron", "idiota", "estúpido", "estupido", 
     "mierda", "joder", "pendejo", "culero", "verga", "hijo de puta", "hijoeputa", "maña"
-
 ]
 patron_groserias = "|".join([re.escape(groseria) for groseria in groserias])
 patron_groserias = patron_groserias.replace("0", "[0o]").replace("e", "[e3]").replace("i", "[i1]")
@@ -53,16 +55,35 @@ def censurar_groseria(comentario):
         comentario = re.sub(patron, censura, comentario, flags=re.IGNORECASE)
     return comentario
 
-# Variable global para almacenar los resultados del procesamiento
+# Variables globales para cachear resultados
 _processed_data = None
+_cached_comments = None
+_silhouette_avg = None
+
+# Cargar silhouette_avg desde un archivo (si existe)
+SILHOUETTE_FILE = "silhouette_avg.txt"
+if os.path.exists(SILHOUETTE_FILE):
+    try:
+        with open(SILHOUETTE_FILE, "r") as f:
+            _silhouette_avg = float(f.read().strip())
+        print(f"Silhouette_avg cargado desde archivo: {_silhouette_avg}")
+    except Exception as e:
+        print(f"Error al cargar silhouette_avg desde archivo: {str(e)}")
+        _silhouette_avg = None
 
 def load_and_process_data(db: Session):
-    global _processed_data
+    global _processed_data, _silhouette_avg
     if _processed_data is not None:
+        print("Usando datos cacheados.")
         return _processed_data
 
-    # Cargar datos de paradas desde la base de datos
-    stops = db.query(Stop).all()
+    start_time = time.time()
+    print("Cargando datos de la base de datos...")
+
+    # Cargar solo las columnas necesarias
+    stops = db.query(Stop.stop_id, Stop.trip_id, Stop.stop_name, Stop.stop_lat, Stop.stop_lon,
+                     Stop.arrival_time, Stop.headway_secs, Stop.wait_time, Stop.delay,
+                     Stop.simulated_delay, Stop.cluster).all()
     if not stops:
         raise HTTPException(status_code=404, detail="No se encontraron paradas en la base de datos")
 
@@ -81,101 +102,115 @@ def load_and_process_data(db: Session):
         "cluster": stop.cluster
     } for stop in stops])
 
-    print("Datos cargados:")
+    print(f"Datos cargados en {time.time() - start_time:.2f} segundos:")
     print(full_data.head())
 
-    # Procesar datos
-    full_data['arrival_time'] = pd.to_datetime(full_data['arrival_time'], errors='coerce')
-    if full_data['arrival_time'].isna().any():
-        print("Advertencia: Algunos valores de arrival_time son NaT:")
-        print(full_data[full_data['arrival_time'].isna()])
-        full_data['arrival_time'] = full_data['arrival_time'].fillna(pd.to_datetime('00:00:00', format='%H:%M:%S'))
+    # Verificar si los datos ya están procesados
+    start_time = time.time()
+    already_processed = (
+        full_data['wait_time'].notnull().all() and
+        full_data['delay'].notnull().all() and
+        full_data['simulated_delay'].notnull().all() and
+        full_data['cluster'].notnull().all() and
+        (full_data['cluster'] != -1).any()
+    )
 
-    full_data = full_data.sort_values(by=['stop_id', 'arrival_time'])
-    full_data['wait_time'] = full_data.groupby('stop_id')['arrival_time'].diff().dt.total_seconds() / 60
-    full_data['wait_time'] = full_data['wait_time'].fillna(full_data['headway_secs'] / 60)
-    print("Registros con wait_time = 0 (después de fillna):")
-    print(full_data[full_data['wait_time'] == 0][['stop_id', 'trip_id', 'arrival_time']].head(10))
+    if not already_processed:
+        print("Datos no considerados como procesados. Razones:")
+        if not full_data['wait_time'].notnull().all():
+            print(f"Valores nulos en wait_time: {full_data['wait_time'].isnull().sum()}")
+        if not full_data['delay'].notnull().all():
+            print(f"Valores nulos en delay: {full_data['delay'].isnull().sum()}")
+        if not full_data['simulated_delay'].notnull().all():
+            print(f"Valores nulos en simulated_delay: {full_data['simulated_delay'].isnull().sum()}")
+        if not full_data['cluster'].notnull().all():
+            print(f"Valores nulos en cluster: {full_data['cluster'].isnull().sum()}")
+        if not (full_data['cluster'] != -1).any():
+            print("Todos los valores de cluster son -1.")
+        raise HTTPException(
+            status_code=500,
+            detail="Los datos en la base de datos no están completamente procesados. Faltan valores en wait_time, delay, simulated_delay o cluster."
+        )
+    print(f"Verificación de datos procesados en {time.time() - start_time:.2f} segundos")
 
-    full_data['headway_mins'] = full_data['headway_secs'] / 60
-    full_data['delay'] = full_data['wait_time'] - full_data['headway_mins']
-    full_data['delay'] = full_data['delay'].fillna(0)
-    np.random.seed(42)
-    simulated_delays = np.random.poisson(lam=5, size=len(full_data))
-    full_data['simulated_delay'] = np.where(full_data['delay'] <= 0, simulated_delays, full_data['delay'])
-
-    print("Datos después de calcular simulated_delay:")
-    print(full_data[['stop_id', 'simulated_delay']].head())
-
-    # Clustering
-    X = full_data[['stop_lat', 'stop_lon', 'simulated_delay']].dropna()
-    print("Datos para clustering (X):")
-    print(X.head())
-    print(f"Número de filas en X: {len(X)}")
-
-    if len(X) < 2:
-        print("Error: No hay suficientes datos para realizar el clustering.")
-        silhouette_avg = 0
-        cluster_delays = pd.Series()
-        delays_by_stop = pd.DataFrame()
-        top_delays = pd.DataFrame()
-        map_center = [0, 0]
-        full_data['cluster'] = -1
+    # Calcular métricas usando los datos ya procesados
+    start_time = time.time()
+    if _silhouette_avg is None:
+        silhouette_avg = silhouette_score(
+            full_data[['stop_lat', 'stop_lon', 'simulated_delay']].dropna(),
+            full_data['cluster'].dropna()
+        ) if (full_data['cluster'] != -1).any() else 0
+        # Guardar silhouette_avg en un archivo
+        with open(SILHOUETTE_FILE, "w") as f:
+            f.write(str(silhouette_avg))
+        print(f"Silhouette_avg calculado y guardado: {silhouette_avg}")
     else:
-        kmeans = MiniBatchKMeans(n_clusters=5, random_state=42, batch_size=1000).fit(X)
-        full_data['cluster'] = kmeans.predict(X)
+        silhouette_avg = _silhouette_avg
+        print("Usando silhouette_avg cacheado.")
+    print(f"Cálculo de silhouette_avg en {time.time() - start_time:.2f} segundos")
 
-        silhouette_avg = silhouette_score(X, kmeans.labels_)
-        cluster_delays = full_data.groupby('cluster')['simulated_delay'].mean()
-        delays_by_stop = full_data.groupby('stop_id').agg({
-            'stop_lat': 'first',
-            'stop_lon': 'first',
-            'stop_name': 'first',
-            'simulated_delay': 'mean'
-        }).reset_index()
-        top_delays = delays_by_stop.sort_values('simulated_delay', ascending=False).head(10)
+    start_time = time.time()
+    cluster_delays = full_data.groupby('cluster')['simulated_delay'].mean()
+    # Excluir el clúster -1
+    cluster_delays = cluster_delays[cluster_delays.index != -1]
+    # Convertir a una lista de diccionarios para el frontend
+    cluster_delays_list = [
+        {"cluster": int(cluster), "average_delay": float(delay)}
+        for cluster, delay in cluster_delays.items()
+    ]
+    
+    delays_by_stop = full_data.groupby('stop_id').agg({
+        'stop_lat': 'first',
+        'stop_lon': 'first',
+        'stop_name': 'first',
+        'simulated_delay': 'mean'
+    }).reset_index()
+ 
+    top_delays = delays_by_stop.sort_values('simulated_delay', ascending=False).head(10)
+    print(f"Agrupación y cálculo de top_delays en {time.time() - start_time:.2f} segundos")
 
-        joblib.dump(kmeans, 'kmeans_model.pkl')
+    # Generar el mapa de calor (usando un muestreo para reducir el tiempo)
+    start_time = time.time()
+    map_center = [delays_by_stop['stop_lat'].mean(), delays_by_stop['stop_lon'].mean()]
+    m = folium.Map(location=map_center, zoom_start=12)
+    # Muestreo: Usar solo el 10% de los datos para el mapa de calor
+    sampled_data = delays_by_stop.sample(frac=0.1, random_state=42)
+    heat_data = [[row['stop_lat'], row['stop_lon'], row['simulated_delay']] 
+                 for _, row in sampled_data.iterrows()]
+    HeatMap(heat_data, radius=15).add_to(m)
+    for _, row in top_delays.iterrows():
+        folium.Marker(
+            location=[row['stop_lat'], row['stop_lon']],
+            popup=f"{row['stop_name']}: {row['simulated_delay']:.1f} min",
+            icon=folium.Icon(color='red', icon='bus', prefix='fa')
+        ).add_to(m)
+    if not os.path.exists("static"):
+        os.makedirs("static")
+    m.save("static/heatmap.html")
+    print(f"Generación del mapa de calor en {time.time() - start_time:.2f} segundos")
 
-        map_center = [delays_by_stop['stop_lat'].mean(), delays_by_stop['stop_lon'].mean()]
-        m = folium.Map(location=map_center, zoom_start=12)
-        heat_data = [[row['stop_lat'], row['stop_lon'], row['simulated_delay']] 
-                     for _, row in delays_by_stop.iterrows()]
-        HeatMap(heat_data, radius=15).add_to(m)
-        for _, row in top_delays.iterrows():
-            folium.Marker(
-                location=[row['stop_lat'], row['stop_lon']],
-                popup=f"{row['stop_name']}: {row['simulated_delay']:.1f} min",
-                icon=folium.Icon(color='red', icon='bus', prefix='fa')
-            ).add_to(m)
-        if not os.path.exists("static"):
-            os.makedirs("static")
-        m.save("static/heatmap.html")
-
-        # Actualizar la base de datos con los resultados
-        batch_size = 1000
-        for start in range(0, len(full_data), batch_size):
-            batch = full_data.iloc[start:start + batch_size]
-            for idx, row in batch.iterrows():
-                stop = db.query(Stop).filter(Stop.stop_id == row['stop_id'], Stop.trip_id == row['trip_id']).first()
-                if stop:
-                    stop.wait_time = row['wait_time']
-                    stop.delay = row['delay']
-                    stop.simulated_delay = row['simulated_delay']
-                    stop.cluster = row['cluster']
-            db.commit()
-
-    _processed_data = (full_data, silhouette_avg, cluster_delays, delays_by_stop, top_delays, map_center)
+    # Usar cluster_delays_list en lugar de cluster_delays
+    _processed_data = (full_data, silhouette_avg, cluster_delays_list, delays_by_stop, top_delays, map_center)
     return _processed_data
 
 def load_comments(db: Session):
-    comments = db.query(Comment).all()
+    global _cached_comments
+    if _cached_comments is not None:
+        print("Usando comentarios cacheados.")
+        return _cached_comments
+
+    start_time = time.time()
+    # Limitar el número de comentarios cargados (por ejemplo, los más recientes 1000)
+    comments = db.query(Comment).order_by(Comment.fecha.desc()).limit(1000).all()
     if not comments:
-        return pd.DataFrame(columns=[
+        df = pd.DataFrame(columns=[
             "comentarios", "source", "fecha", "tiene_groseria", 
             "comentarios_censurados", "etiqueta", "etiqueta_predicha", "relevancia"
         ])
-    return pd.DataFrame([{
+        _cached_comments = df
+        return df
+
+    df = pd.DataFrame([{
         "comentarios": comment.comentario,
         "source": comment.source,
         "fecha": comment.fecha,
@@ -185,6 +220,9 @@ def load_comments(db: Session):
         "etiqueta_predicha": comment.etiqueta_predicha,
         "relevancia": comment.relevancia
     } for comment in comments])
+    _cached_comments = df
+    print(f"Carga de comentarios en {time.time() - start_time:.2f} segundos")
+    return df
 
 # Rutas de datos protegidas
 @router.get("/stops/{cluster_id}", response_model=List[StopDetails])
@@ -205,14 +243,19 @@ async def get_stop_details(stop_id: str, db: Session = Depends(get_db), current_
 
 @router.get("/metrics")
 async def get_metrics(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    start_time = time.time()
+    logging.info("Procesando solicitud para /metrics...")
+
     full_data, silhouette_avg, cluster_delays, _, top_delays, map_center = load_and_process_data(db)
-    comments = db.query(Comment).all() # Filtrar por usuario
     comments_df = load_comments(db)
 
     # Eliminar duplicados basados en el comentario censurado
+    start_time_comments = time.time()
     comments_df = comments_df.drop_duplicates(subset=["comentarios_censurados"])
+    print(f"Eliminación de duplicados en comentarios en {time.time() - start_time_comments:.2f} segundos")
 
     # Preparar datos para las cards
+    start_time_cards = time.time()
     positivos = comments_df[comments_df["etiqueta_predicha"] == "positivo_sugerencia"]
     top_positivos = positivos.sort_values(by="relevancia", ascending=False).head(5)[["comentarios_censurados"]].to_dict(orient="records")
     top_positivos = [item["comentarios_censurados"] for item in top_positivos]
@@ -224,20 +267,15 @@ async def get_metrics(db: Session = Depends(get_db), current_user: User = Depend
     neutros = comments_df[comments_df["etiqueta_predicha"] == "neutral"]
     top_neutros = neutros.sort_values(by="relevancia", ascending=False).head(5)[["comentarios_censurados"]].to_dict(orient="records")
     top_neutros = [item["comentarios_censurados"] for item in top_neutros]
+    print(f"Preparación de tarjetas de comentarios en {time.time() - start_time_cards:.2f} segundos")
 
-    cluster_ids = []
-    for x in full_data['cluster'].unique():
-        try:
-            x_int = int(float(x))
-            if not pd.isna(x_int):
-                cluster_ids.append(x_int)
-        except (ValueError, TypeError):
-            continue
-    cluster_ids.sort()
+    cluster_ids = sorted([int(x) for x in full_data['cluster'].unique() if x != -1])
 
+    total_time = time.time() - start_time
+    logging.info(f"Solicitud para /metrics procesada en {total_time:.2f} segundos")
     return {
         "silhouette_avg": silhouette_avg,
-        "cluster_delays": cluster_delays.to_dict(),
+        "cluster_delays": cluster_delays,  # Esto ahora es cluster_delays_list (lista de diccionarios)
         "top_delays": top_delays.to_dict(orient='records'),
         "map_center": map_center,
         "cluster_ids": cluster_ids,
@@ -257,6 +295,9 @@ async def classify_comment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    start_time = time.time()
+    logging.info("Procesando solicitud para /classify_comment...")
+
     nuevo_comentario = data.comment
     if not nuevo_comentario:
         raise HTTPException(status_code=400, detail="No se proporcionó un comentario")
@@ -267,7 +308,7 @@ async def classify_comment(
         Comment.user_email == current_user.email
     ).first()
     if existing_comment:
-        # Si ya existe, devolver el comentario existente sin duplicar
+        logging.info(f"Solicitud para /classify_comment procesada en {time.time() - start_time:.2f} segundos (comentario existente)")
         return {
             "comment": existing_comment.comentario,
             "censored_comment": existing_comment.comentario_censurado,
@@ -284,7 +325,7 @@ async def classify_comment(
 
     fecha_actual = datetime(2025, 4, 18).date()
     new_comment = Comment(
-        user_email=current_user.email,  # Guardar el email del usuario
+        user_email=current_user.email,
         comentario=nuevo_comentario,
         source="Formulario Web",
         fecha=fecha_actual,
@@ -296,7 +337,11 @@ async def classify_comment(
     )
     db.add(new_comment)
     db.commit()
+    # Invalidar el caché de comentarios después de agregar uno nuevo
+    global _cached_comments
+    _cached_comments = None
 
+    logging.info(f"Solicitud para /classify_comment procesada en {time.time() - start_time:.2f} segundos")
     return {
         "comment": nuevo_comentario,
         "censored_comment": comentario_censurado,
