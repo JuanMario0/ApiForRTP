@@ -34,6 +34,7 @@ class Stop(Base):
 class Comment(Base):
     __tablename__ = "comments"
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_email = Column(String, nullable=False)
     comentario = Column(String)
     source = Column(String)
     fecha = Column(Date)

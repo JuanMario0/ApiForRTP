@@ -96,3 +96,15 @@ class CommentCreate(BaseModel):
 
 class CommentRequest(BaseModel):
     comment: str
+
+
+# Esquema para el comentario entrante
+class CommentCreate(BaseModel):
+    comment: str
+
+# Esquema para la respuesta
+class CommentResponse(BaseModel):
+    comment: str
+    censored_comment: str
+    category: str
+    relevance: float

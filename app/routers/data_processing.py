@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
+from sklearn.cluster import MiniBatchKMeans
 from app.db.database import get_db
 from app.db.models import Stop, Comment
 import pandas as pd
@@ -34,7 +35,8 @@ except FileNotFoundError:
 # Lista de groserías y funciones para manejarlas
 groserias = [
     "puto", "puta", "chinga", "cabrón", "cabron", "idiota", "estúpido", "estupido", 
-    "mierda", "joder", "pendejo", "culero", "verga"
+    "mierda", "joder", "pendejo", "culero", "verga", "hijo de puta", "hijoeputa", "maña"
+
 ]
 patron_groserias = "|".join([re.escape(groseria) for groseria in groserias])
 patron_groserias = patron_groserias.replace("0", "[0o]").replace("e", "[e3]").replace("i", "[i1]")
@@ -44,7 +46,7 @@ def contiene_groseria(comentario):
     return bool(re.search(patron_groserias, comentario))
 
 def censurar_groseria(comentario):
-    comentario_lower = comentario.lower()
+    comentario = comentario.lower()
     for groseria in groserias:
         censura = "*" * len(groseria)
         patron = groseria.replace("e", "[e3]").replace("i", "[i1]").replace("o", "[0o]")
@@ -57,7 +59,7 @@ _processed_data = None
 def load_and_process_data(db: Session):
     global _processed_data
     if _processed_data is not None:
-        return _processed_data  # Retornar datos procesados si ya existen
+        return _processed_data
 
     # Cargar datos de paradas desde la base de datos
     stops = db.query(Stop).all()
@@ -67,7 +69,7 @@ def load_and_process_data(db: Session):
     # Convertir a DataFrame
     full_data = pd.DataFrame([{
         "stop_id": stop.stop_id,
-        "trip_id": stop.trip_id,  # Incluimos trip_id para mantener consistencia
+        "trip_id": stop.trip_id,
         "stop_name": stop.stop_name,
         "stop_lat": stop.stop_lat,
         "stop_lon": stop.stop_lon,
@@ -79,6 +81,9 @@ def load_and_process_data(db: Session):
         "cluster": stop.cluster
     } for stop in stops])
 
+    print("Datos cargados:")
+    print(full_data.head())
+
     # Procesar datos
     full_data['arrival_time'] = pd.to_datetime(full_data['arrival_time'], errors='coerce')
     if full_data['arrival_time'].isna().any():
@@ -88,9 +93,7 @@ def load_and_process_data(db: Session):
 
     full_data = full_data.sort_values(by=['stop_id', 'arrival_time'])
     full_data['wait_time'] = full_data.groupby('stop_id')['arrival_time'].diff().dt.total_seconds() / 60
-    # Reemplazar NaN con headway_secs / 60 (convertido a minutos)
     full_data['wait_time'] = full_data['wait_time'].fillna(full_data['headway_secs'] / 60)
-    # Depuración: Mostrar registros con wait_time = 0
     print("Registros con wait_time = 0 (después de fillna):")
     print(full_data[full_data['wait_time'] == 0][['stop_id', 'trip_id', 'arrival_time']].head(10))
 
@@ -101,55 +104,67 @@ def load_and_process_data(db: Session):
     simulated_delays = np.random.poisson(lam=5, size=len(full_data))
     full_data['simulated_delay'] = np.where(full_data['delay'] <= 0, simulated_delays, full_data['delay'])
 
+    print("Datos después de calcular simulated_delay:")
+    print(full_data[['stop_id', 'simulated_delay']].head())
+
     # Clustering
     X = full_data[['stop_lat', 'stop_lon', 'simulated_delay']].dropna()
-    kmeans = KMeans(n_clusters=5, random_state=42).fit(X)
-    full_data['cluster'] = kmeans.predict(X)
+    print("Datos para clustering (X):")
+    print(X.head())
+    print(f"Número de filas en X: {len(X)}")
 
-    # Actualizar la base de datos con los resultados (en lotes para mejor rendimiento)
-    batch_size = 10000
-    for start in range(0, len(full_data), batch_size):
-        batch = full_data.iloc[start:start + batch_size]
-        for idx, row in batch.iterrows():
-            stop = db.query(Stop).filter(Stop.stop_id == row['stop_id'], Stop.trip_id == row['trip_id']).first()
-            if stop:
-                stop.wait_time = row['wait_time']
-                stop.delay = row['delay']
-                stop.simulated_delay = row['simulated_delay']
-                stop.cluster = row['cluster']
-        db.commit()
+    if len(X) < 2:
+        print("Error: No hay suficientes datos para realizar el clustering.")
+        silhouette_avg = 0
+        cluster_delays = pd.Series()
+        delays_by_stop = pd.DataFrame()
+        top_delays = pd.DataFrame()
+        map_center = [0, 0]
+        full_data['cluster'] = -1
+    else:
+        kmeans = MiniBatchKMeans(n_clusters=5, random_state=42, batch_size=1000).fit(X)
+        full_data['cluster'] = kmeans.predict(X)
 
-    # Métricas
-    silhouette_avg = silhouette_score(X, kmeans.labels_)
-    cluster_delays = full_data.groupby('cluster')['simulated_delay'].mean()
-    delays_by_stop = full_data.groupby('stop_id').agg({
-        'stop_lat': 'first',
-        'stop_lon': 'first',
-        'stop_name': 'first',
-        'simulated_delay': 'mean'
-    }).reset_index()
-    top_delays = delays_by_stop.sort_values('simulated_delay', ascending=False).head(10)
+        silhouette_avg = silhouette_score(X, kmeans.labels_)
+        cluster_delays = full_data.groupby('cluster')['simulated_delay'].mean()
+        delays_by_stop = full_data.groupby('stop_id').agg({
+            'stop_lat': 'first',
+            'stop_lon': 'first',
+            'stop_name': 'first',
+            'simulated_delay': 'mean'
+        }).reset_index()
+        top_delays = delays_by_stop.sort_values('simulated_delay', ascending=False).head(10)
 
-    # Guardar modelo de clustering
-    joblib.dump(kmeans, 'kmeans_model.pkl')
+        joblib.dump(kmeans, 'kmeans_model.pkl')
 
-    # Generar mapa de calor
-    map_center = [delays_by_stop['stop_lat'].mean(), delays_by_stop['stop_lon'].mean()]
-    m = folium.Map(location=map_center, zoom_start=12)
-    heat_data = [[row['stop_lat'], row['stop_lon'], row['simulated_delay']] 
-                 for _, row in delays_by_stop.iterrows()]
-    HeatMap(heat_data, radius=15).add_to(m)
-    for _, row in top_delays.iterrows():
-        folium.Marker(
-            location=[row['stop_lat'], row['stop_lon']],
-            popup=f"{row['stop_name']}: {row['simulated_delay']:.1f} min",
-            icon=folium.Icon(color='red', icon='bus', prefix='fa')
-        ).add_to(m)
-    if not os.path.exists("static"):
-        os.makedirs("static")
-    m.save("static/heatmap.html")
+        map_center = [delays_by_stop['stop_lat'].mean(), delays_by_stop['stop_lon'].mean()]
+        m = folium.Map(location=map_center, zoom_start=12)
+        heat_data = [[row['stop_lat'], row['stop_lon'], row['simulated_delay']] 
+                     for _, row in delays_by_stop.iterrows()]
+        HeatMap(heat_data, radius=15).add_to(m)
+        for _, row in top_delays.iterrows():
+            folium.Marker(
+                location=[row['stop_lat'], row['stop_lon']],
+                popup=f"{row['stop_name']}: {row['simulated_delay']:.1f} min",
+                icon=folium.Icon(color='red', icon='bus', prefix='fa')
+            ).add_to(m)
+        if not os.path.exists("static"):
+            os.makedirs("static")
+        m.save("static/heatmap.html")
 
-    # Almacenar los resultados en la variable global
+        # Actualizar la base de datos con los resultados
+        batch_size = 1000
+        for start in range(0, len(full_data), batch_size):
+            batch = full_data.iloc[start:start + batch_size]
+            for idx, row in batch.iterrows():
+                stop = db.query(Stop).filter(Stop.stop_id == row['stop_id'], Stop.trip_id == row['trip_id']).first()
+                if stop:
+                    stop.wait_time = row['wait_time']
+                    stop.delay = row['delay']
+                    stop.simulated_delay = row['simulated_delay']
+                    stop.cluster = row['cluster']
+            db.commit()
+
     _processed_data = (full_data, silhouette_avg, cluster_delays, delays_by_stop, top_delays, map_center)
     return _processed_data
 
@@ -191,7 +206,11 @@ async def get_stop_details(stop_id: str, db: Session = Depends(get_db), current_
 @router.get("/metrics")
 async def get_metrics(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     full_data, silhouette_avg, cluster_delays, _, top_delays, map_center = load_and_process_data(db)
+    comments = db.query(Comment).all() # Filtrar por usuario
     comments_df = load_comments(db)
+
+    # Eliminar duplicados basados en el comentario censurado
+    comments_df = comments_df.drop_duplicates(subset=["comentarios_censurados"])
 
     # Preparar datos para las cards
     positivos = comments_df[comments_df["etiqueta_predicha"] == "positivo_sugerencia"]
@@ -242,6 +261,20 @@ async def classify_comment(
     if not nuevo_comentario:
         raise HTTPException(status_code=400, detail="No se proporcionó un comentario")
 
+    # Verificar si el comentario ya existe para este usuario
+    existing_comment = db.query(Comment).filter(
+        Comment.comentario == nuevo_comentario,
+        Comment.user_email == current_user.email
+    ).first()
+    if existing_comment:
+        # Si ya existe, devolver el comentario existente sin duplicar
+        return {
+            "comment": existing_comment.comentario,
+            "censored_comment": existing_comment.comentario_censurado,
+            "category": existing_comment.etiqueta_predicha,
+            "relevance": existing_comment.relevancia
+        }
+
     tiene_groseria = contiene_groseria(nuevo_comentario)
     comentario_censurado = censurar_groseria(nuevo_comentario)
 
@@ -251,6 +284,7 @@ async def classify_comment(
 
     fecha_actual = datetime(2025, 4, 18).date()
     new_comment = Comment(
+        user_email=current_user.email,  # Guardar el email del usuario
         comentario=nuevo_comentario,
         source="Formulario Web",
         fecha=fecha_actual,
