@@ -4,6 +4,7 @@ from fastapi import HTTPException, status
 from app.hashing import Hash
 from app.schemas import UserCreate, UpdateUser
 from app.oauth import get_current_user
+from app.db.models import User
 
 
 def CrearUsuario(usuario: UserCreate, db: Session):
@@ -24,15 +25,11 @@ def CrearUsuario(usuario: UserCreate, db: Session):
         )
 
 
-
-def ObtenerUsuario(userId, db:Session):
-        usuario = db.query(models.User).filter(models.User.id == userId).first()
-        if not usuario:
-            raise HTTPException(
-                 status_code=status.HTTP_404_NOT_FOUND,
-                 detail= f"No existe el usuario con el id {userId}"
-            )
-        return usuario
+def ObtenerUsuario(userId: int, db: Session):
+    usuario = db.query(User).filter(User.id == userId).first()
+    if not usuario:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    return usuario
 
 
 def EliminarUsuario(userId, db:Session):
@@ -48,7 +45,7 @@ def EliminarUsuario(userId, db:Session):
       return {"Respuesta":"Usuario borrado correctamente"}
 
 
-def ObtenerUsuario(db:Session):
+def ObtenerUsuarios(db:Session):
       data = db.query(models.User).all()
       return data 
 

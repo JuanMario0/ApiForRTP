@@ -2,7 +2,7 @@
     "version": 2,
     "builds": [
         {
-            "src": "app/main.py",
+            "src": "main.py",
             "use": "@vercel/python",
             "config": {
                 "maxLambdaSize": "15mb",
@@ -13,7 +13,8 @@
     "routes": [
         {
             "src": "/(.*)",
-            "dest": "app/main.py"
+            "dest": "main.py"
         }
-    ]
+    ],
+    "installCommand": "pip install -r requirements.txt"
 }
