@@ -2,7 +2,7 @@
 .env
 
 # Ignorar archivos de modelos y datos generados
-*.pkl
+#*.pkl
 *.csv
 
 # Ignorar carpetas específicas
