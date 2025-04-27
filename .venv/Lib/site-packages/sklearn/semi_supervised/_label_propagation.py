@@ -52,9 +52,9 @@ Learning (2006), pp. 193-216
 Non-Parametric Function Induction in Semi-Supervised Learning. AISTAT 2005
 """
 
-# Authors: The scikit-learn developers
-# SPDX-License-Identifier: BSD-3-Clause
-
+# Authors: Clay Woolam <clay@woolam.org>
+#          Utkarsh Upadhyay <mail@musicallyut.in>
+# License: BSD
 import warnings
 from abc import ABCMeta, abstractmethod
 from numbers import Integral, Real
@@ -70,7 +70,7 @@ from ..utils._param_validation import Interval, StrOptions
 from ..utils.extmath import safe_sparse_dot
 from ..utils.fixes import laplacian as csgraph_laplacian
 from ..utils.multiclass import check_classification_targets
-from ..utils.validation import check_is_fitted, validate_data
+from ..utils.validation import check_is_fitted
 
 
 class BaseLabelPropagation(ClassifierMixin, BaseEstimator, metaclass=ABCMeta):
@@ -210,8 +210,7 @@ class BaseLabelPropagation(ClassifierMixin, BaseEstimator, metaclass=ABCMeta):
         """
         check_is_fitted(self)
 
-        X_2d = validate_data(
-            self,
+        X_2d = self._validate_data(
             X,
             accept_sparse=["csc", "csr", "coo", "dok", "bsr", "lil", "dia"],
             reset=False,
@@ -256,8 +255,7 @@ class BaseLabelPropagation(ClassifierMixin, BaseEstimator, metaclass=ABCMeta):
         self : object
             Returns the instance itself.
         """
-        X, y = validate_data(
-            self,
+        X, y = self._validate_data(
             X,
             y,
             accept_sparse=["csr", "csc"],
@@ -336,11 +334,6 @@ class BaseLabelPropagation(ClassifierMixin, BaseEstimator, metaclass=ABCMeta):
         self.transduction_ = transduction.ravel()
         return self
 
-    def __sklearn_tags__(self):
-        tags = super().__sklearn_tags__()
-        tags.input_tags.sparse = True
-        return tags
-
 
 class LabelPropagation(BaseLabelPropagation):
     """Label Propagation classifier.
@@ -364,7 +357,7 @@ class LabelPropagation(BaseLabelPropagation):
     max_iter : int, default=1000
         Change maximum number of iterations allowed.
 
-    tol : float, default=1e-3
+    tol : float, 1e-3
         Convergence tolerance: threshold to consider the system at steady
         state.
 

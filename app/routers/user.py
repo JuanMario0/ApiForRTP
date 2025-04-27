@@ -21,8 +21,9 @@ router = APIRouter(
 
 @router.get('/', response_model=List[ShowUser], status_code=status.HTTP_200_OK)
 def ObtenerUusuarios(db:Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    data = user.ObtenerUsuario(db)
+    data = user.ObtenerUsuarios(db)
     return data
+
 
 
 @router.post("/", response_model=ShowUser)
