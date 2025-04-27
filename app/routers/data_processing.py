@@ -26,12 +26,20 @@ router = APIRouter(
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
 
+# Obtener el directorio del archivo data_processing.py
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Construir las rutas a los archivos .pkl
+CLASSIFIER_PATH = os.path.join(BASE_DIR, "..", "models", "comment_classifier_final.pkl")
+VECTORIZER_PATH = os.path.join(BASE_DIR, "..", "models", "vectorizer_final.pkl")
+
 # Cargar el modelo y vectorizador de PLN
 try:
-    comment_classifier = joblib.load("app\\models\\comment_classifier_final.pkl")
-    vectorizer = joblib.load("app\\models\\vectorizer_final.pkl")
-except FileNotFoundError:
-    print("Error: No se encontraron los archivos comment_classifier.pkl o vectorizer.pkl.")
+    comment_classifier = joblib.load(CLASSIFIER_PATH)
+    vectorizer = joblib.load(VECTORIZER_PATH)
+    logging.info("Modelos .pkl cargados exitosamente.")
+except FileNotFoundError as e:
+    logging.error(f"Error: No se encontraron los archivos .pkl: {str(e)}")
     comment_classifier = None
     vectorizer = None
 
