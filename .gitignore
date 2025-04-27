@@ -21,3 +21,4 @@ __pycache__/
 
 full_dataset.csv
 comments_processed.csv
+dump.sql
